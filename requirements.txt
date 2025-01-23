@@ -1,0 +1,9 @@
+torch
+torchvision
+pillow
+norse
+numpy
+matplotlib
+ipykernel
+scikit-learn
+tqdm
