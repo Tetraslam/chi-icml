@@ -40,6 +40,7 @@ env/
 ENV/
 .env
 .venv
+.venv/
 
 # IDE specific files
 .idea/
@@ -58,3 +59,9 @@ logs/
 # OS specific
 .DS_Store
 Thumbs.db
+
+# uv files
+uv.lock
+hello.py
+.python-version
+pyproject.toml
