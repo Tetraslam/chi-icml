@@ -3,13 +3,16 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from norse.torch import LIFCell, LICell, PoissonEncoder, ConstantCurrentLIFEncoder
+from norse.torch import PoissonEncoder, ConstantCurrentLIFEncoder
 from torch.utils.data import Dataset, DataLoader
 from torchvision import datasets, transforms
+import torch.nn.functional as F
 from tqdm.notebook import tqdm, trange
 from PIL import Image
 import os
 import matplotlib.pyplot as plt
+
+
 from fluoresce import NeuronVisualizer
 
 train_transform = transforms.Compose([
@@ -47,70 +50,86 @@ class UnlabeledImageDataset(Dataset): # define custom datset for the unlabeled t
             
         return image, 1  # Return a dummy label
 
+class LIFCell(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.tau_m = 20.0  # Membrane time constant
+        self.v_threshold = -55.0  # Firing threshold
+        self.v_reset = -70.0  # Reset potential
+        
+    def forward(self, x, s):
+        # Initialize state if None
+        if s is None:
+            s = torch.zeros_like(x)
+        
+        # Update membrane potential
+        dv = (x - s) / self.tau_m
+        v = s + dv
+        
+        # Check for spikes
+        spikes = (v >= self.v_threshold).float()
+        
+        # Reset membrane potential where spikes occurred
+        v = (1 - spikes) * v + spikes * self.v_reset
+        
+        return v, v
+
 class SNN(torch.nn.Module):
     def __init__(self, input_features, hidden_features, output_features, recurrent_cell):
         super(SNN, self).__init__()
         self.input_features = input_features
-        # First linear layer to transform input to hidden size
-        self.fc_in = torch.nn.Linear(input_features, hidden_features, bias=False)
-        # Recurrent cell
-        self.cell = recurrent_cell
-        # Output layer
-        self.fc_out = torch.nn.Linear(hidden_features, output_features, bias=False)
-        self.out = LICell()
+        self.hidden_features = hidden_features
+        self.output_features = output_features
+        self.fc_in = nn.Linear(input_features, hidden_features)
+        self.recurrent_cell = recurrent_cell
+        self.fc_out = nn.Linear(hidden_features, output_features)
+        self.spikes_record = []
+        self.membrane_record = []  # Will only store membrane states of spiking neurons
+        self.spiking_neuron_indices = []  # Track which neurons are spiking
         
-        # For visualization
-        self.visualizer = None
-        self.record_activity = False
-                             
     def forward(self, x):
         """
-        x shape: (seq_length, batch_size, channels, height, width)
-        returns: (seq_length, batch_size, num_classes)
+        Forward pass of SNN
+        x shape: (seq_length, batch_size, input_features)
+        returns: (seq_length, batch_size, output_features)
         """
-        seq_length, batch_size, channels, height, width = x.shape
-        s1 = so = None  # Initialize neuron states
-        voltages = []  # Store membrane potentials
+        seq_length = x.shape[0]
+        batch_size = x.shape[1]
         
-        hidden_states = []  # Store hidden states for visualization
-        spike_states = []   # Store spike states for visualization
-
+        # Initialize hidden states and outputs
+        s = None
+        membrane_potentials = []  # Store membrane potentials
+        spikes = []  # Store spikes
+        outputs = []  # Store outputs
+        
         for ts in range(seq_length):
-            # Flatten spatial dimensions but keep batch dimension
-            z = x[ts].reshape(batch_size, -1)  # (batch_size, channels * height * width)
-            # Transform to hidden size
-            z = self.fc_in(z)  # (batch_size, hidden_features)
-            # Process through recurrent cell
-            z, s1 = self.cell(z, s1)
+            z = self.fc_in(x[ts, :])
+            z, s = self.recurrent_cell(z, s)
             
-            if self.record_activity and self.visualizer is not None:
-                # Record neuronal activity for visualization
-                # Take first batch item for visualization
-                spikes = (z > 0).float()[0]  # Binary spikes
-                voltages = s1.v[0] if hasattr(s1, 'v') else z[0]  # Membrane potential
-                self.visualizer.update_state(spikes, voltages)
+            # Get membrane potentials
+            if isinstance(s, tuple):
+                v = s[0]  # Get membrane potential
+            else:
+                v = s
             
-            # Transform to output size
-            z = self.fc_out(z)  # (batch_size, output_features)
-            # Final LIF layer
-            vo, so = self.out(z, so)
-            voltages += [vo]
+            # Convert to numpy for processing
+            v_np = v.detach().cpu().numpy()
+            z_np = z.detach().cpu().numpy()
+            
+            # Store membrane potentials and spikes
+            membrane_potentials.append(v_np)
+            spikes.append(z_np)
+            
+            # Forward pass through output layer
+            z = self.fc_out(z)
+            outputs.append(z)
         
-        return torch.stack(voltages)  # (seq_length, batch_size, output_features)
-    
-    def enable_recording(self, hidden_size=None):
-        """Enable recording of neuronal activity"""
-        if hidden_size is None:
-            hidden_size = self.fc_in.out_features
-        self.visualizer = NeuronVisualizer(hidden_size=hidden_size)
-        self.record_activity = True
-    
-    def disable_recording(self):
-        """Disable recording of neuronal activity"""
-        if self.visualizer is not None:
-            self.visualizer.close()
-        self.visualizer = None
-        self.record_activity = False
+        # Store records for later analysis
+        self.membrane_record = np.array(membrane_potentials)
+        self.spikes_record = np.array(spikes)
+        
+        # Stack outputs along time dimension
+        return torch.stack(outputs, dim=0)  # (seq_length, batch_size, output_features)
 
 class Model(torch.nn.Module):
     def __init__(self, encoder, snn, decoder):
@@ -120,10 +139,18 @@ class Model(torch.nn.Module):
         self.decoder = decoder
 
     def forward(self, x):
-        x = self.encoder(x)
-        x = self.snn(x)
-        log_p_y = self.decoder(x)
+        # x shape: (batch_size, channels, height, width)
+        batch_size = x.shape[0]
+        # Flatten spatial dimensions
+        x = x.reshape(batch_size, -1)  # (batch_size, channels*height*width)
+        # Encode into spike sequence
+        x = self.encoder(x)  # (seq_length, batch_size, input_features)
+        # Process through SNN
+        x = self.snn(x)  # (seq_length, batch_size, num_classes)
+        # Decode to predictions
+        log_p_y = self.decoder(x)  # (batch_size, num_classes)
         return log_p_y
+
 
 def decode(x):
     """decode SNN output to predictions
@@ -132,45 +159,43 @@ def decode(x):
     """
     # average over time steps first
     x = x.mean(dim=0)  # (batch_size, num_classes)
-    # log softmax
-    log_p_y = torch.nn.functional.log_softmax(x, dim=1)
+    # ensure we have 2D tensor (batch_size, num_classes)
+    if x.dim() == 1:
+        x = x.unsqueeze(0)  # Add batch dimension if missing
+    # log softmax over classes dimension (last dimension)
+    log_p_y = torch.nn.functional.log_softmax(x, dim=-1)
     return log_p_y
 
-def train(model, device, train_loader, optimizer, epoch, max_epochs=5):
-    model.train()
-    total_loss = 0
-    correct = 0
-    total = 0
+def train(model, device, train_loader, optimizer, epoch, max_epochs=5, worm_visualizer=None):
+    """Train the model for one epoch"""
+    model.train() # set the model to training mode
     
-    # move the progress abars
-    pbar = tqdm(train_loader, desc=f'Epoch {epoch}/{max_epochs}', leave=True)
-    
-    for batch_idx, (data, target) in enumerate(pbar):
+    for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
-        output = model(data)
-        loss = torch.nn.functional.nll_loss(output, target)
         
-        # backward pass
+        # Forward pass - data is already in correct shape (batch_size, channels, height, width)
+        output = model(data)
+        
+        # Calculate loss and backpropagate
+        loss = F.cross_entropy(output, target)
         loss.backward()
         optimizer.step()
         
-        # Update metrics
-        total_loss += loss.item()
-        pred = output.argmax(dim=1)
-        correct += pred.eq(target.view_as(pred)).sum().item()
-        total += target.size(0)
-        
-        # Update progress bar
-        mean_loss = total_loss / (batch_idx + 1)
-        accuracy = 100. * correct / total
-        pbar.set_postfix({
-            'loss': f'{mean_loss:.4f}',
-            'acc': f'{accuracy:.1f}%'
-        })
-    
-    mean_loss = total_loss / len(train_loader)
-    return total_loss, mean_loss
+        if batch_idx % 10 == 0:
+            print(f'Train Epoch: {epoch}/{max_epochs} [{batch_idx * len(data)}/{len(train_loader.dataset)} '
+                  f'({100. * batch_idx / len(train_loader):.0f}%)]\tLoss: {loss.item():.6f}')
+            
+            # Get the latest activity records
+            spikes = model.snn.spikes_record
+            membrane = model.snn.membrane_record
+            
+            # Update visualization if available
+            if worm_visualizer is not None:
+                # Convert tensors to numpy arrays and move to CPU if needed
+                spikes_np = spikes.detach().cpu().numpy() if torch.is_tensor(spikes) else spikes
+                membrane_np = membrane.detach().cpu().numpy() if torch.is_tensor(membrane) else membrane
+                worm_visualizer.update(spikes_np, membrane_np)
 
 def test(model, device, test_loader):
     model.eval()
@@ -184,7 +209,7 @@ def test(model, device, test_loader):
         for data, target in pbar:
             data, target = data.to(device), target.to(device)
             output = model(data)
-            test_loss += torch.nn.functional.nll_loss(output, target, reduction='sum').item()
+            test_loss += F.cross_entropy(output, target, reduction='sum').item()
             pred = output.argmax(dim=1)
             correct += pred.eq(target.view_as(pred)).sum().item()
             
@@ -200,44 +225,40 @@ def test(model, device, test_loader):
     print(f'\nTest set: Average loss: {test_loss:.4f}, Accuracy: {correct}/{len(test_loader.dataset)} ({accuracy:.1f}%)\n')
     return test_loss, accuracy
 
-def run_training(model, optimizer, train_loader, test_loader, epochs=5):
+def run_training(model, optimizer, train_loader, test_loader, epochs=5, worm_visualizer=None):
     """Complete training pipeline"""
+    print("Starting training...")
+    
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    
+    # Training metrics
     training_losses = []
-    mean_losses = []
-    test_losses = []
-    accuracies = []
+    test_accuracies = []
     
-    # Create progress bar for epochs
-    epoch_pbar = trange(epochs, desc='Training Progress', leave=True)
-    
-    for epoch in epoch_pbar:
-        # Train
-        training_loss, mean_loss = train(model, DEVICE, train_loader, optimizer, epoch + 1, epochs)
-        training_losses.append(training_loss)
-        mean_losses.append(mean_loss)
+    # Training loop
+    for epoch in range(1, epochs + 1):
+        # Train for one epoch
+        train(model, device, train_loader, optimizer, epoch, epochs, worm_visualizer)
         
-        # Test
-        test_loss, accuracy = test(model, DEVICE, test_loader)
-        test_losses.append(test_loss)
-        accuracies.append(accuracy)
+        # Test the model
+        test_loss, test_accuracy = test(model, device, test_loader)
+        print(f'\nTest set: Average loss: {test_loss:.4f}, '
+              f'Accuracy: {100. * test_accuracy:.1f}%\n')
         
-        # Update epoch progress bar
-        epoch_pbar.set_postfix({
-            'train_loss': f'{mean_loss:.4f}',
-            'test_loss': f'{test_loss:.4f}',
-            'accuracy': f'{accuracy:.1f}%'
-        })
+        # Record metrics
+        test_accuracies.append(test_accuracy)
     
-    return model, {'training_losses': training_losses,
-                  'mean_losses': mean_losses,
-                  'test_losses': test_losses,
-                  'accuracies': accuracies}
+    return model, {
+        'test_accuracies': test_accuracies
+    }
 
 def predict_image(model, image_tensor):
     model.eval()
     with torch.no_grad():
         # Add batch dimension and move to device
-        image_tensor = image_tensor.unsqueeze(0).to(DEVICE)
+        image_tensor = image_tensor.unsqueeze(0).to(device)
         # Get model prediction
         output = model(image_tensor)
         # Get predicted class
@@ -252,93 +273,119 @@ def encode_image_to_spikes(img, T=32, f_max=20):
     spikes = spike_probabilities[:, 0].reshape(T, 64*64).to_sparse().coalesce()
     return spikes
 
-if __name__ == '__main__':
-    T = 32  # number of time steps
-    LR = 0.001  # reduced learning rate for stability
-    INPUT_FEATURES = 64 * 64  # flattened input size (grayscale)
-    HIDDEN_FEATURES = 256  # increased hidden size
-    OUTPUT_FEATURES = len(datasets.ImageFolder(root=flowers_train_dir).classes)  # number of flower classes
-    EPOCHS = 5
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def get_default_config():
+    """Return default configuration for training"""
+    return {
+        'T': 32,  # number of time steps
+        'LR': 0.001,  # learning rate
+        'INPUT_FEATURES': 64 * 64,  # flattened input size
+        'HIDDEN_FEATURES': 256,
+        'BATCH_SIZE': 32,
+        'EPOCHS': 2,
+        'F_MAX': 20  # for Poisson encoding
+    }
 
-    # Create datasets
-    flowers_train_dataset = datasets.ImageFolder(root=flowers_train_dir, transform=train_transform)
-    flowers_test_dataset = UnlabeledImageDataset(root_dir=flowers_test_dir, transform=test_transform)
-
-    # Create data loaders
-    batch_size = 32
-    flowers_train_loader = DataLoader(
-        flowers_train_dataset, 
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0  # Set to 0 to avoid multiprocessing issues
-    )
-    flowers_test_loader = DataLoader(
-        flowers_test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0 
-    )
-
-    print(f"Training dataset size: {len(flowers_train_dataset)}")
-    print(f"Test dataset size: {len(flowers_test_dataset)}")
-    print(f"Number of classes: {len(flowers_train_dataset.classes)}")
-    print(f"Classes: {flowers_train_dataset.classes}")
-
-    # instantiate the model
-    poisson_encoder = PoissonEncoder(seq_length=T, f_max=20)
+def setup_model(config, num_classes, device):
+    """Setup the complete model architecture"""
+    poisson_encoder = PoissonEncoder(seq_length=config['T'], f_max=config['F_MAX'])
     lif_snn = SNN(
-        input_features=INPUT_FEATURES,      # 64x64 = 4096
-        hidden_features=HIDDEN_FEATURES,    # 256 hidden neurons
-        output_features=OUTPUT_FEATURES,    # number of classes
-        recurrent_cell=LIFCell()           # Leaky Integrate-and-Fire neuron
+        input_features=config['INPUT_FEATURES'],
+        hidden_features=config['HIDDEN_FEATURES'],
+        output_features=num_classes,
+        recurrent_cell=LIFCell()
     )
-
+    
     model = Model(
         encoder=poisson_encoder,
         snn=lif_snn,
-        decoder=decode).to(DEVICE)
+        decoder=decode
+    ).to(device)
+    
+    return model
 
-    # Create optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+def setup_data_loaders(train_dir, test_dir, batch_size, train_transform, test_transform):
+    """Setup data loaders for training and testing"""
+    train_dataset = datasets.ImageFolder(root=train_dir, transform=train_transform)
+    test_dataset = UnlabeledImageDataset(root_dir=test_dir, transform=test_transform)
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0
+    )
+    
+    return train_loader, test_loader, len(train_dataset.classes)
 
+def train_model(config=None, data_dirs=None, transforms=None, device=None, worm_visualizer=None):
+    """Main training function that can be called from other scripts"""
+    # Use default config if none provided
+    if config is None:
+        config = get_default_config()
+    
+    # Use default device if none provided
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Use default data directories if none provided
+    if data_dirs is None:
+        data_dirs = {
+            'train': "datasets/flowers/train",
+            'test': "datasets/flowers/test"
+        }
+    
+    # Use default transforms if none provided
+    if transforms is None:
+        transforms = {
+            'train': train_transform,
+            'test': test_transform
+        }
+    
+    # Setup data loaders
+    train_loader, test_loader, num_classes = setup_data_loaders(
+        data_dirs['train'],
+        data_dirs['test'],
+        config['BATCH_SIZE'],
+        transforms['train'],
+        transforms['test']
+    )
+    
+    # Setup model
+    model = setup_model(config, num_classes, device)
+    
+    # Setup optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=config['LR'])
+    
     # Train the model
-    print("Starting training...")
-    lif_snn.enable_recording()
-    trained_model, training_metrics = run_training(
+    trained_model, metrics = run_training(
         model=model,
         optimizer=optimizer,
-        train_loader=flowers_train_loader,
-        test_loader=flowers_test_loader
+        train_loader=train_loader,
+        test_loader=test_loader,
+        epochs=config['EPOCHS'],
+        worm_visualizer=worm_visualizer
     )
-    lif_snn.disable_recording()
+    
+    return trained_model, metrics
 
-    # Plot training results
+if __name__ == '__main__':
+    # This code only runs if train.py is run directly
+    print("Training model with default configuration...")
+    model, metrics = train_model()
+    
+    # Save the model
+    torch.save(model.state_dict(), "trained_model.pth")
+    
+    # Plot results
     plt.figure(figsize=(12, 4))
-
-    plt.subplot(1, 2, 1)
-    plt.plot(training_metrics['mean_losses'], label='Training Loss')
-    plt.plot(training_metrics['test_losses'], label='Test Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.title('Training and Test Loss')
-
-    plt.subplot(1, 2, 2)
-    plt.plot(training_metrics['accuracies'], label='Test Accuracy')
+    plt.plot(metrics['test_accuracies'], label='Test Accuracy')
     plt.xlabel('Epoch')
     plt.ylabel('Accuracy (%)')
     plt.legend()
-    plt.title('Test Accuracy')
-
-    plt.tight_layout()
     plt.show()
-
-    torch.save(trained_model.state_dict(), 'snn_model.pth')
-    print("Training completed and model saved!")
-
-    # Try prediction on a sample image
-    sample_img, true_label = flowers_train_dataset[0]
-    predicted_class = predict_image(trained_model, sample_img)
-    print(f"True label: {flowers_train_dataset.classes[true_label]}")
-    print(f"Predicted class: {flowers_train_dataset.classes[predicted_class]}")
