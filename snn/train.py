@@ -1,3 +1,5 @@
+# preprocess and train
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -8,6 +10,7 @@ from tqdm.notebook import tqdm, trange
 from PIL import Image
 import os
 import matplotlib.pyplot as plt
+from fluoresce import NeuronVisualizer
 
 train_transform = transforms.Compose([
     transforms.Resize((64, 64)),          # input is 64 x 64
@@ -47,18 +50,30 @@ class UnlabeledImageDataset(Dataset): # define custom datset for the unlabeled t
 class SNN(torch.nn.Module):
     def __init__(self, input_features, hidden_features, output_features, recurrent_cell):
         super(SNN, self).__init__()
-        # simple one hidden layer SNN
         self.input_features = input_features
+        # First linear layer to transform input to hidden size
         self.fc_in = torch.nn.Linear(input_features, hidden_features, bias=False)
+        # Recurrent cell
         self.cell = recurrent_cell
+        # Output layer
         self.fc_out = torch.nn.Linear(hidden_features, output_features, bias=False)
         self.out = LICell()
-                            
+        
+        # For visualization
+        self.visualizer = None
+        self.record_activity = False
+                             
     def forward(self, x):
-        # pass input through SNN
+        """
+        x shape: (seq_length, batch_size, channels, height, width)
+        returns: (seq_length, batch_size, num_classes)
+        """
         seq_length, batch_size, channels, height, width = x.shape
         s1 = so = None  # Initialize neuron states
         voltages = []  # Store membrane potentials
+        
+        hidden_states = []  # Store hidden states for visualization
+        spike_states = []   # Store spike states for visualization
 
         for ts in range(seq_length):
             # Flatten spatial dimensions but keep batch dimension
@@ -67,6 +82,14 @@ class SNN(torch.nn.Module):
             z = self.fc_in(z)  # (batch_size, hidden_features)
             # Process through recurrent cell
             z, s1 = self.cell(z, s1)
+            
+            if self.record_activity and self.visualizer is not None:
+                # Record neuronal activity for visualization
+                # Take first batch item for visualization
+                spikes = (z > 0).float()[0]  # Binary spikes
+                voltages = s1.v[0] if hasattr(s1, 'v') else z[0]  # Membrane potential
+                self.visualizer.update_state(spikes, voltages)
+            
             # Transform to output size
             z = self.fc_out(z)  # (batch_size, output_features)
             # Final LIF layer
@@ -74,6 +97,20 @@ class SNN(torch.nn.Module):
             voltages += [vo]
         
         return torch.stack(voltages)  # (seq_length, batch_size, output_features)
+    
+    def enable_recording(self, hidden_size=None):
+        """Enable recording of neuronal activity"""
+        if hidden_size is None:
+            hidden_size = self.fc_in.out_features
+        self.visualizer = NeuronVisualizer(hidden_size=hidden_size)
+        self.record_activity = True
+    
+    def disable_recording(self):
+        """Disable recording of neuronal activity"""
+        if self.visualizer is not None:
+            self.visualizer.close()
+        self.visualizer = None
+        self.record_activity = False
 
 class Model(torch.nn.Module):
     def __init__(self, encoder, snn, decoder):
@@ -267,12 +304,14 @@ if __name__ == '__main__':
 
     # Train the model
     print("Starting training...")
+    lif_snn.enable_recording()
     trained_model, training_metrics = run_training(
         model=model,
         optimizer=optimizer,
         train_loader=flowers_train_loader,
         test_loader=flowers_test_loader
     )
+    lif_snn.disable_recording()
 
     # Plot training results
     plt.figure(figsize=(12, 4))
